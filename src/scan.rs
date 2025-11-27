@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use futures::future::join_all;              // NEW: for batching async requests
+use futures::future::join_all;
 use reqwest::Client;
 use scraper::{Html, Selector};
 
@@ -7,6 +7,7 @@ use scraper::{Html, Selector};
 pub enum IconColor {
     Red,
     Yellow,
+    Green,
 }
 
 #[derive(Debug, Clone)]
@@ -69,9 +70,7 @@ pub async fn get_last_page(client: &Client) -> Result<u32> {
 
     for el in doc.select(&link_sel) {
         if let Some(href) = el.value().attr("href") {
-            // Look for links that include this table + a page param
             if href.contains("validators/included_deposits") && href.contains("p=") {
-                // crude parse: find "p=" then read digits
                 if let Some(idx) = href.find("p=") {
                     let p_part = &href[idx + 2..];
                     let mut end = p_part.len();
@@ -96,7 +95,7 @@ pub async fn get_last_page(client: &Client) -> Result<u32> {
     Ok(last_page)
 }
 
-/// Scan a single page and return all red/yellow hits on that page.
+/// Scan a single page and return all red/yellow/green hits on that page.
 async fn scan_single_page(client: &Client, page: u32) -> Result<Vec<ValidatorHit>> {
     let url = page_url(page);
     println!("Fetching page {page}: {url}");
@@ -122,6 +121,7 @@ async fn scan_single_page(client: &Client, page: u32) -> Result<Vec<ValidatorHit
     let cell_sel = Selector::parse("td").unwrap();
     let red_icon_sel = Selector::parse(".text-danger").unwrap();
     let yellow_icon_sel = Selector::parse(".text-warning").unwrap();
+    let green_icon_sel = Selector::parse(".text-success").unwrap();
 
     let mut page_rows = 0u32;
     let mut page_hits = 0u32;
@@ -147,8 +147,9 @@ async fn scan_single_page(client: &Client, page: u32) -> Result<Vec<ValidatorHit
 
         let is_red = state_cell.select(&red_icon_sel).next().is_some();
         let is_yellow = state_cell.select(&yellow_icon_sel).next().is_some();
+        let is_green = state_cell.select(&green_icon_sel).next().is_some();
 
-        if !is_red && !is_yellow {
+        if !is_red && !is_yellow && !is_green {
             continue;
         }
 
@@ -184,10 +185,21 @@ async fn scan_single_page(client: &Client, page: u32) -> Result<Vec<ValidatorHit
             });
             page_hits += 1;
         }
+
+        if is_green {
+            hits.push(ValidatorHit {
+                page,
+                url: url.clone(),
+                index: index.clone(),
+                public_key: public_key.clone(),
+                color: IconColor::Green,
+            });
+            page_hits += 1;
+        }
     }
 
     println!(
-        "Page {page}: rows={page_rows}, hits={page_hits} (red+yellow Active)"
+        "Page {page}: rows={page_rows}, hits={page_hits} (red+yellow+green Active)"
     );
 
     Ok(hits)
@@ -209,7 +221,6 @@ pub async fn scan_included_deposits(
     let pages: Vec<u32> = (start_page..=end_page).collect();
 
     for chunk in pages.chunks(concurrency) {
-        // For each batch of pages, fire them in parallel.
         let futures = chunk.iter().map(|&page| {
             let client = client.clone();
             async move { scan_single_page(&client, page).await }
@@ -229,15 +240,13 @@ pub async fn scan_included_deposits(
         }
     }
 
-    // Dedupe by (public_key, color) as before
+    // Dedupe by (public_key, color)
     all_hits.sort_by(|a, b| {
-        (a.public_key.as_str(), a.color as i32, a.page).cmp(&(
-            b.public_key.as_str(),
-            b.color as i32,
-            b.page,
-        ))
+        a.public_key
+            .cmp(&b.public_key)
+            .then(a.page.cmp(&b.page))
     });
-    all_hits.dedup_by(|a, b| a.public_key == b.public_key && a.color as i32 == b.color as i32);
+    all_hits.dedup_by(|a, b| a.public_key == b.public_key && a.color as u8 == b.color as u8);
 
     Ok(all_hits)
 }
